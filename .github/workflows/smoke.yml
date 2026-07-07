@@ -11,7 +11,7 @@ jobs:
       - name: BreachLens scan (CF Access smoke)
         uses: ./
         with:
-          api-url:                 ${{ vars.BREACHLENS_API_URL }}
+          api-url:                 ${{ vars.BREACHLENS_API_URL || secrets.BREACHLENS_API_URL }}
           api-token:               ${{ secrets.BREACHLENS_API_TOKEN }}
           cf-access-client-id:     ${{ secrets.CF_ACCESS_CLIENT_ID }}
           cf-access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}

@@ -45,6 +45,28 @@ inputs:
     required: false
     default: ''
 
+  cf-access-client-id:
+    description: |
+      Cloudflare Access service-token client id. Set this (together with
+      cf-access-client-secret) ONLY when your BreachLens deployment sits
+      behind a Cloudflare Access perimeter (hosted / Anthropic-fronted
+      instances, e.g. aurora.breachlens.dev). Sent as the
+      `CF-Access-Client-Id` header on every request so the CF Access edge
+      admits the non-browser CI call BEFORE the api's own token auth runs.
+      Leave empty for self-hosted deployments not gated by CF Access.
+      Store as a GitHub secret (e.g. CF_ACCESS_CLIENT_ID).
+    required: false
+    default: ''
+
+  cf-access-client-secret:
+    description: |
+      Cloudflare Access service-token secret (pairs with
+      cf-access-client-id). Sent as the `CF-Access-Client-Secret` header.
+      Both must be set together or neither. Store as a GitHub secret
+      (e.g. CF_ACCESS_CLIENT_SECRET).
+    required: false
+    default: ''
+
   repo-id:
     description: |
       Legacy explicit mode — the BreachLens Repository ID to scan.
@@ -160,6 +182,13 @@ runs:
           CRITICAL|HIGH|MEDIUM|LOW|INFO|none) ;;
           *) echo "::error::Invalid severity-gate '${{ inputs.severity-gate }}' — must be CRITICAL/HIGH/MEDIUM/LOW/INFO/none."; exit 1 ;;
         esac
+        # Cloudflare Access service token is optional, but the pair is all-or-nothing.
+        CF_ID="${{ inputs.cf-access-client-id }}"
+        CF_SECRET="${{ inputs.cf-access-client-secret }}"
+        if { [[ -n "$CF_ID" && -z "$CF_SECRET" ]] || [[ -z "$CF_ID" && -n "$CF_SECRET" ]]; }; then
+          echo "::error::cf-access-client-id and cf-access-client-secret must be set together (or neither)."
+          exit 1
+        fi
         echo "✓ Inputs valid."
 
     - name: Trigger scan
@@ -173,6 +202,8 @@ runs:
         CONTAINER_ID:   ${{ inputs.container-id }}
         DOMAIN_ID:      ${{ inputs.domain-id }}
         SCAN_TYPES:     ${{ inputs.scan-types }}
+        CF_CLIENT_ID:     ${{ inputs.cf-access-client-id }}
+        CF_CLIENT_SECRET: ${{ inputs.cf-access-client-secret }}
       run: |
         # Phase A7 — auto-discovery context. Composite actions can't use
         # the github expression context in step env blocks (parser rejects it),
@@ -194,6 +225,13 @@ runs:
           AUTH_HEADER="Authorization: Bearer $API_TOKEN"
         else
           AUTH_HEADER="Cookie: connect.sid=$SESSION"
+        fi
+        # Optional Cloudflare Access service-token headers. Built as a bash
+        # array so it expands to ZERO curl args when unset (an empty string
+        # "-H ''" would send a bogus header). Used on every curl below.
+        CF_HEADERS=()
+        if [[ -n "$CF_CLIENT_ID" && -n "$CF_CLIENT_SECRET" ]]; then
+          CF_HEADERS=(-H "CF-Access-Client-Id: $CF_CLIENT_ID" -H "CF-Access-Client-Secret: $CF_CLIENT_SECRET")
         fi
 
         # ── Endpoint + body selection ─────────────────────────────────
@@ -251,6 +289,7 @@ runs:
         echo "Body: $BODY"
         RESPONSE=$(curl -fsS -X POST "$ENDPOINT" \
           -H "$AUTH_HEADER" \
+          "${CF_HEADERS[@]}" \
           -H "Content-Type: application/json" \
           -d "$BODY")
         echo "$RESPONSE"
@@ -280,11 +319,17 @@ runs:
         SCAN_ID:           ${{ steps.trigger.outputs.scan-id }}
         POLL_INTERVAL:     ${{ inputs.poll-interval-seconds }}
         TIMEOUT_MIN:       ${{ inputs.timeout-minutes }}
+        CF_CLIENT_ID:      ${{ inputs.cf-access-client-id }}
+        CF_CLIENT_SECRET:  ${{ inputs.cf-access-client-secret }}
       run: |
         if [[ -n "$API_TOKEN" ]]; then
           AUTH_HEADER="Authorization: Bearer $API_TOKEN"
         else
           AUTH_HEADER="Cookie: connect.sid=$SESSION"
+        fi
+        CF_HEADERS=()
+        if [[ -n "$CF_CLIENT_ID" && -n "$CF_CLIENT_SECRET" ]]; then
+          CF_HEADERS=(-H "CF-Access-Client-Id: $CF_CLIENT_ID" -H "CF-Access-Client-Secret: $CF_CLIENT_SECRET")
         fi
         DEADLINE=$(( $(date +%s) + (TIMEOUT_MIN * 60) ))
         STATUS=PENDING
@@ -295,7 +340,7 @@ runs:
           fi
           sleep "$POLL_INTERVAL"
           STATUS=$(curl -fsS "$API_URL/api/scans/$SCAN_ID" \
-            -H "$AUTH_HEADER" | jq -r '.status // "UNKNOWN"')
+            -H "$AUTH_HEADER" "${CF_HEADERS[@]}" | jq -r '.status // "UNKNOWN"')
           echo "[poll] scan $SCAN_ID status: $STATUS"
         done
         echo "status=$STATUS" >> "$GITHUB_OUTPUT"
@@ -313,15 +358,22 @@ runs:
         API_TOKEN:  ${{ inputs.api-token }}
         SESSION:    ${{ inputs.session-cookie }}
         SCAN_ID:    ${{ steps.trigger.outputs.scan-id }}
+        CF_CLIENT_ID:     ${{ inputs.cf-access-client-id }}
+        CF_CLIENT_SECRET: ${{ inputs.cf-access-client-secret }}
       run: |
         if [[ -n "$API_TOKEN" ]]; then
           AUTH_HEADER="Authorization: Bearer $API_TOKEN"
         else
           AUTH_HEADER="Cookie: connect.sid=$SESSION"
         fi
+        CF_HEADERS=()
+        if [[ -n "$CF_CLIENT_ID" && -n "$CF_CLIENT_SECRET" ]]; then
+          CF_HEADERS=(-H "CF-Access-Client-Id: $CF_CLIENT_ID" -H "CF-Access-Client-Secret: $CF_CLIENT_SECRET")
+        fi
         SARIF_PATH="breachlens-${SCAN_ID}.sarif"
         curl -fsS "$API_URL/api/scans/$SCAN_ID/export.sarif" \
           -H "$AUTH_HEADER" \
+          "${CF_HEADERS[@]}" \
           -o "$SARIF_PATH"
         echo "path=$SARIF_PATH" >> "$GITHUB_OUTPUT"
         BYTES=$(wc -c < "$SARIF_PATH")

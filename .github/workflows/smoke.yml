@@ -1,0 +1,21 @@
+name: BreachLens smoke
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: BreachLens scan (CF Access smoke)
+        uses: ./
+        with:
+          api-url:                 ${{ vars.BREACHLENS_API_URL }}
+          api-token:               ${{ secrets.BREACHLENS_API_TOKEN }}
+          cf-access-client-id:     ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          cf-access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          domain-id:               cmqi47qzn0001147rydm07mcd
+          scan-types:              DAST
+          severity-gate:           none
+          upload-sarif:            false

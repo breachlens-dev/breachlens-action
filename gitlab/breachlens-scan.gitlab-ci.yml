@@ -1,0 +1,185 @@
+# BreachLens security scan — GitLab CI/CD template
+# =============================================================================
+# Triggers a BreachLens scan, waits for completion, downloads the SARIF result,
+# and (optionally) fails the pipeline on findings severity. Talks to the same
+# /api/scans endpoints as the GitHub Action and the `breachlens` CLI — one
+# severity gate, one SARIF shape, identical verdicts.
+#
+# Server-side scanning: the GitLab runner only *tells* your BreachLens
+# deployment to scan; your code is cloned + analysed on the BreachLens server,
+# not on the runner. So the job image is tiny (alpine + curl + jq) and needs no
+# language runtime.
+#
+# ── Setup ────────────────────────────────────────────────────────────────────
+# 1. Onboard the repo / container / domain in BreachLens and note its ID (the
+#    cuid in the resource detail URL, e.g. /repositories/<id>). GitLab has NO
+#    auto-discovery yet — you pass the BreachLens resource ID explicitly.
+#    (Auto-onboarding is GitHub-only today, via /api/scans/from-github.)
+# 2. Mint a BreachLens API token: Settings → API Tokens → Generate token.
+#    Scopes: scans:trigger + scans:read.
+# 3. Add CI/CD variables (Settings → CI/CD → Variables):
+#      BREACHLENS_API_URL     https://breachlens.example.com   (not masked)
+#      BREACHLENS_API_TOKEN   blt_...                          (masked + protected)
+#      BREACHLENS_REPO_ID     <cuid>            (or _CONTAINER_ID / _DOMAIN_ID)
+#    Optional — only if BreachLens sits behind Cloudflare Access:
+#      CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET           (masked)
+#
+# ── Use ──────────────────────────────────────────────────────────────────────
+# Option A — include this template (adds a `breachlens_scan` job that runs on
+# merge requests + the default branch):
+#
+#   include:
+#     - remote: 'https://raw.githubusercontent.com/breachlens-dev/breachlens-action/main/gitlab/breachlens-scan.gitlab-ci.yml'
+#   # then set the CI/CD variables above; override any default on the job, e.g.
+#   variables:
+#     BREACHLENS_SEVERITY_GATE: "HIGH"
+#
+#   (self-hosted GitLab that mirrors this repo can use `include: project:`/`local:`
+#   instead of the GitHub `remote:` URL.)
+#
+# Option B — copy the hidden `.breachlens-scan` job into your own .gitlab-ci.yml
+# and `extends: .breachlens-scan` from a job with your own stage/rules.
+# =============================================================================
+
+.breachlens-scan:
+  image: alpine:3.20
+  variables:
+    # Exactly one target is required (a BreachLens resource ID):
+    BREACHLENS_REPO_ID: ""
+    BREACHLENS_CONTAINER_ID: ""
+    BREACHLENS_DOMAIN_ID: ""
+    # Gate + tuning:
+    BREACHLENS_SEVERITY_GATE: "none"      # CRITICAL|HIGH|MEDIUM|LOW|INFO|none
+    BREACHLENS_SCAN_TYPES: ""             # csv e.g. SAST,SCA,SECRET,IAC ; blank = server default
+    BREACHLENS_POLL_INTERVAL: "15"        # seconds between status polls
+    BREACHLENS_TIMEOUT_MIN: "45"          # hard timeout (PENTEST_FULL can take 30+ min)
+    # Cloudflare Access service token — leave blank unless behind CF Access:
+    CF_ACCESS_CLIENT_ID: ""
+    CF_ACCESS_CLIENT_SECRET: ""
+    # TLS verification — only for self-hosted / internal APIs with a private CA:
+    BREACHLENS_CA_CERT: ""                # PEM of a CA to verify against (preferred)
+    BREACHLENS_INSECURE: "false"          # "true" = skip TLS verify (-k); internal / self-signed only
+  before_script:
+    - apk add --no-cache curl jq >/dev/null
+  script:
+    - |
+      set -eu
+
+      # Required connection variables (nicer message than a bare set -u abort).
+      : "${BREACHLENS_API_URL:?set BREACHLENS_API_URL as a CI/CD variable}"
+      : "${BREACHLENS_API_TOKEN:?set BREACHLENS_API_TOKEN as a masked CI/CD variable}"
+
+      # Exactly one target ID.
+      TARGETS=0
+      [ -n "$BREACHLENS_REPO_ID" ]      && TARGETS=$((TARGETS + 1)) || true
+      [ -n "$BREACHLENS_CONTAINER_ID" ] && TARGETS=$((TARGETS + 1)) || true
+      [ -n "$BREACHLENS_DOMAIN_ID" ]    && TARGETS=$((TARGETS + 1)) || true
+      if [ "$TARGETS" -ne 1 ]; then
+        echo "ERROR: set exactly one of BREACHLENS_REPO_ID / BREACHLENS_CONTAINER_ID / BREACHLENS_DOMAIN_ID"
+        exit 1
+      fi
+
+      case "$BREACHLENS_SEVERITY_GATE" in
+        CRITICAL|HIGH|MEDIUM|LOW|INFO|none) ;;
+        *) echo "ERROR: BREACHLENS_SEVERITY_GATE must be CRITICAL/HIGH/MEDIUM/LOW/INFO/none"; exit 1 ;;
+      esac
+
+      # Optional Cloudflare Access headers. Service-token id/secret contain no
+      # whitespace, so a "Name:value" string (curl accepts no space after the
+      # colon) word-splits safely under sh — no bash arrays needed. Empty
+      # CF_ARGS expands to zero curl args.
+      CF_ARGS=""
+      if [ -n "$CF_ACCESS_CLIENT_ID" ] && [ -n "$CF_ACCESS_CLIENT_SECRET" ]; then
+        CF_ARGS="-H CF-Access-Client-Id:$CF_ACCESS_CLIENT_ID -H CF-Access-Client-Secret:$CF_ACCESS_CLIENT_SECRET"
+      fi
+
+      # TLS verification for self-hosted / internal APIs. Prefer verifying
+      # against a custom CA (BREACHLENS_CA_CERT, PEM) -> --cacert; fall back to
+      # skip-verify (-k) only when BREACHLENS_INSECURE=true. Both blank -> the
+      # default public-CA verification (correct for a Cloudflare-fronted URL).
+      TLS_ARGS=""
+      if [ -n "$BREACHLENS_CA_CERT" ]; then
+        printf '%s\n' "$BREACHLENS_CA_CERT" > /tmp/breachlens-ca.pem
+        TLS_ARGS="--cacert /tmp/breachlens-ca.pem"
+      elif [ "$BREACHLENS_INSECURE" = "true" ]; then
+        TLS_ARGS="-k"
+      fi
+      AUTH="Authorization: Bearer $BREACHLENS_API_TOKEN"
+
+      # ── 1. Trigger ──────────────────────────────────────────────────────────
+      if [ -n "$BREACHLENS_REPO_ID" ]; then
+        ENDPOINT="$BREACHLENS_API_URL/api/repos/$BREACHLENS_REPO_ID/scan"
+      elif [ -n "$BREACHLENS_CONTAINER_ID" ]; then
+        ENDPOINT="$BREACHLENS_API_URL/api/containers/$BREACHLENS_CONTAINER_ID/scan"
+      else
+        ENDPOINT="$BREACHLENS_API_URL/api/domains/$BREACHLENS_DOMAIN_ID/scan"
+      fi
+
+      if [ -n "$BREACHLENS_SCAN_TYPES" ]; then
+        BODY=$(jq -nc --arg t "$BREACHLENS_SCAN_TYPES" '{scanTypes: ($t | split(","))}')
+      else
+        BODY='{}'
+      fi
+
+      echo "POST $ENDPOINT"
+      RESP=$(curl -fsS -X POST "$ENDPOINT" -H "$AUTH" $CF_ARGS $TLS_ARGS -H 'Content-Type: application/json' -d "$BODY")
+      SCAN_ID=$(echo "$RESP" | jq -r '.id // .scanJobId // empty')
+      [ -n "$SCAN_ID" ] || { echo "ERROR: no scan id in response: $RESP"; exit 1; }
+      echo "Triggered scan $SCAN_ID"
+
+      # ── 2. Poll to completion (or FAILED / timeout) ─────────────────────────
+      DEADLINE=$(( $(date +%s) + BREACHLENS_TIMEOUT_MIN * 60 ))
+      STATUS=PENDING
+      while [ "$STATUS" != "COMPLETED" ] && [ "$STATUS" != "FAILED" ]; do
+        if [ "$(date +%s)" -gt "$DEADLINE" ]; then
+          echo "ERROR: scan $SCAN_ID exceeded ${BREACHLENS_TIMEOUT_MIN}-min timeout (last status: $STATUS)"
+          exit 1
+        fi
+        sleep "$BREACHLENS_POLL_INTERVAL"
+        STATUS=$(curl -fsS "$BREACHLENS_API_URL/api/scans/$SCAN_ID" -H "$AUTH" $CF_ARGS $TLS_ARGS | jq -r '.status // "UNKNOWN"')
+        echo "[poll] $STATUS"
+      done
+      [ "$STATUS" != "FAILED" ] || { echo "ERROR: scan $SCAN_ID FAILED"; exit 1; }
+
+      # ── 3. Fetch SARIF ──────────────────────────────────────────────────────
+      curl -fsS "$BREACHLENS_API_URL/api/scans/$SCAN_ID/export.sarif" -H "$AUTH" $CF_ARGS $TLS_ARGS -o breachlens.sarif
+      echo "Wrote breachlens.sarif ($(wc -c < breachlens.sarif) bytes)"
+
+      # ── 4. Count by severity + gate ─────────────────────────────────────────
+      C=$(jq '[.runs[]?.results[]? | select(.properties.severity == "CRITICAL")] | length' breachlens.sarif)
+      H=$(jq '[.runs[]?.results[]? | select(.properties.severity == "HIGH")]     | length' breachlens.sarif)
+      M=$(jq '[.runs[]?.results[]? | select(.properties.severity == "MEDIUM")]   | length' breachlens.sarif)
+      L=$(jq '[.runs[]?.results[]? | select(.properties.severity == "LOW")]      | length' breachlens.sarif)
+      I=$(jq '[.runs[]?.results[]? | select(.properties.severity == "INFO")]     | length' breachlens.sarif)
+      echo "findings — C:$C H:$H M:$M L:$L I:$I"
+
+      # Gate order: CRITICAL > HIGH > MEDIUM > LOW > INFO. `none` never fails.
+      case "$BREACHLENS_SEVERITY_GATE" in
+        CRITICAL) N=$C ;;
+        HIGH)     N=$(( C + H )) ;;
+        MEDIUM)   N=$(( C + H + M )) ;;
+        LOW)      N=$(( C + H + M + L )) ;;
+        INFO)     N=$(( C + H + M + L + I )) ;;
+        none)     N=0 ;;
+      esac
+      if [ "$BREACHLENS_SEVERITY_GATE" != "none" ] && [ "$N" -gt 0 ]; then
+        echo "Severity gate $BREACHLENS_SEVERITY_GATE: $N finding(s) at or above threshold — failing pipeline."
+        exit 1
+      fi
+      echo "Severity gate $BREACHLENS_SEVERITY_GATE: passed."
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - breachlens.sarif
+
+# Concrete job so `include:`-ing this file gives you a ready scan on merge
+# requests + the default branch. Override its stage/rules/variables in your own
+# pipeline, or delete it and `extends: .breachlens-scan` from your own job.
+breachlens_scan:
+  extends: .breachlens-scan
+  stage: test
+  interruptible: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

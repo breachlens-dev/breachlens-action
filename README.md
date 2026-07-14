@@ -311,6 +311,40 @@ jobs:
 
 ---
 
+## Other CI platforms — GitLab CI & Jenkins
+
+The same trigger → poll → SARIF → severity-gate contract ships as ready-to-use
+templates for other runners, so BreachLens gates a build from any pipeline, not
+just GitHub Actions:
+
+| Platform | Template | How to use |
+|---|---|---|
+| **GitLab CI** | [`gitlab/breachlens-scan.gitlab-ci.yml`](./gitlab/breachlens-scan.gitlab-ci.yml) | `include:` the hosted job, set two variables |
+| **Jenkins** | [`jenkins/Jenkinsfile`](./jenkins/Jenkinsfile) | Declarative pipeline, curl-based, alpine agent |
+
+**GitLab CI** — include the shared job straight from this repo:
+
+```yaml
+# .gitlab-ci.yml
+include:
+  - remote: 'https://raw.githubusercontent.com/breachlens-dev/breachlens-action/main/gitlab/breachlens-scan.gitlab-ci.yml'
+variables:
+  BREACHLENS_REPO_ID: "<your-repo-id>"
+  BREACHLENS_SEVERITY_GATE: "HIGH"
+```
+
+**Jenkins** — copy [`jenkins/Jenkinsfile`](./jenkins/Jenkinsfile) into your repo;
+it curls the scan endpoint, polls for completion, and fails the build on the
+severity gate. Credentials come from Jenkins secret bindings — no token in the file.
+
+> Prefer not to copy files by hand? Your BreachLens deployment can generate a
+> tailored pipeline file for any of these platforms under
+> **Settings → Integrations → CI/CD pipeline file** — pick the platform, scan
+> shape, and severity gate, and it emits a ready-to-paste file plus the exact
+> secrets to add.
+
+---
+
 ## What flows into the GitHub Security tab
 
 When `upload-sarif: true` (default) and your workflow has `security-events: write` permission, the SARIF output uploads to GitHub Code Scanning. Findings appear:

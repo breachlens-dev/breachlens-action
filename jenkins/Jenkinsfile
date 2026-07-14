@@ -1,0 +1,152 @@
+// BreachLens security scan — Jenkins declarative pipeline template
+// =============================================================================
+// Triggers a BreachLens scan, waits for completion, downloads the SARIF, and
+// FAILS the build when the severity gate is breached. Same trigger -> poll ->
+// SARIF -> gate contract as the GitHub Action and the GitLab template — one
+// severity gate, one SARIF shape, identical verdicts.
+//
+// Server-side scanning: the Jenkins agent only *tells* your BreachLens
+// deployment to scan; your code is cloned + analysed on the BreachLens server,
+// not on the runner. So the job needs nothing but curl + jq (this template runs
+// them in a tiny alpine container) — no language runtime, no scanners.
+//
+// ── Setup ─────────────────────────────────────────────────────────────────────
+// 1. Onboard the repo / container / domain in BreachLens and note its ID (the
+//    cuid in the resource detail URL, e.g. /repositories/<id>). Jenkins has NO
+//    auto-discovery — you pass the BreachLens resource ID explicitly.
+// 2. Mint a BreachLens API token: Settings -> API Tokens -> Generate token
+//    (scopes: scans:trigger + scans:read). Add it as a Jenkins credential of
+//    kind "Secret text" with ID  breachlens-api-token.
+// 3. Set BREACHLENS_API_URL (parameter default below, a global env var, or a
+//    folder property).
+// 4. Behind Cloudflare Access? Add two more "Secret text" credentials
+//    (breachlens-cf-access-id / breachlens-cf-access-secret) and uncomment the
+//    two environment{} lines + the CF_ARGS line in the script.
+//
+// ── Agent note ────────────────────────────────────────────────────────────────
+// This uses a docker agent (`alpine:3.20`) so curl + jq are guaranteed. If your
+// controller doesn't run docker agents, replace the `agent { docker … }` block
+// with `agent { label 'your-agent' }` and ensure curl + jq are on that agent
+// (then drop the `apk add` line from the script).
+// =============================================================================
+
+pipeline {
+  agent {
+    docker { image 'alpine:3.20' }
+  }
+
+  parameters {
+    string(name: 'BREACHLENS_API_URL',      defaultValue: 'https://breachlens.example.com', description: 'Base URL of your BreachLens deployment')
+    string(name: 'BREACHLENS_TARGET',       defaultValue: '',     description: 'BreachLens resource ID (the cuid from the resource URL)')
+    choice(name: 'BREACHLENS_TARGET_KIND',  choices: ['repo', 'container', 'domain'], description: 'What kind of target BREACHLENS_TARGET is')
+    choice(name: 'BREACHLENS_SEVERITY_GATE', choices: ['none', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'], description: 'Fail the build at this severity or higher')
+    string(name: 'BREACHLENS_SCAN_TYPES',   defaultValue: '',     description: 'CSV e.g. SAST,SCA,SECRET,IAC (blank = server default)')
+  }
+
+  options {
+    // Hard ceiling — PENTEST_FULL can take 30+ min. The script also self-times-out.
+    timeout(time: 60, unit: 'MINUTES')
+  }
+
+  environment {
+    BREACHLENS_API_TOKEN = credentials('breachlens-api-token')
+    // Cloudflare Access — uncomment + create these credentials if BreachLens is
+    // behind a CF Access perimeter:
+    // CF_ACCESS_CLIENT_ID     = credentials('breachlens-cf-access-id')
+    // CF_ACCESS_CLIENT_SECRET = credentials('breachlens-cf-access-secret')
+  }
+
+  stages {
+    stage('BreachLens scan') {
+      steps {
+        sh '''
+          set -eu
+          apk add --no-cache curl jq >/dev/null
+
+          : "${BREACHLENS_API_URL:?set BREACHLENS_API_URL}"
+          : "${BREACHLENS_API_TOKEN:?add the breachlens-api-token credential}"
+          [ -n "$BREACHLENS_TARGET" ] || { echo "ERROR: set BREACHLENS_TARGET (a BreachLens resource ID)"; exit 1; }
+
+          case "$BREACHLENS_SEVERITY_GATE" in
+            CRITICAL|HIGH|MEDIUM|LOW|INFO|none) ;;
+            *) echo "ERROR: BREACHLENS_SEVERITY_GATE must be CRITICAL/HIGH/MEDIUM/LOW/INFO/none"; exit 1 ;;
+          esac
+
+          AUTH="Authorization: Bearer $BREACHLENS_API_TOKEN"
+
+          # Optional Cloudflare Access headers. Service-token id/secret contain no
+          # whitespace, so "Name:value" (no space after the colon) word-splits
+          # safely under sh. Empty CF_ARGS expands to zero curl args.
+          CF_ARGS=""
+          # CF_ARGS="-H CF-Access-Client-Id:$CF_ACCESS_CLIENT_ID -H CF-Access-Client-Secret:$CF_ACCESS_CLIENT_SECRET"
+
+          case "$BREACHLENS_TARGET_KIND" in
+            repo)      ENDPOINT="$BREACHLENS_API_URL/api/repos/$BREACHLENS_TARGET/scan" ;;
+            container) ENDPOINT="$BREACHLENS_API_URL/api/containers/$BREACHLENS_TARGET/scan" ;;
+            domain)    ENDPOINT="$BREACHLENS_API_URL/api/domains/$BREACHLENS_TARGET/scan" ;;
+            *)         echo "ERROR: BREACHLENS_TARGET_KIND must be repo/container/domain"; exit 1 ;;
+          esac
+
+          if [ -n "$BREACHLENS_SCAN_TYPES" ]; then
+            BODY=$(jq -nc --arg t "$BREACHLENS_SCAN_TYPES" '{scanTypes: ($t | split(","))}')
+          else
+            BODY='{}'
+          fi
+
+          # ── 1. Trigger ──────────────────────────────────────────────────────
+          echo "POST $ENDPOINT"
+          RESP=$(curl -fsS -X POST "$ENDPOINT" -H "$AUTH" $CF_ARGS -H 'Content-Type: application/json' -d "$BODY")
+          SCAN_ID=$(echo "$RESP" | jq -r '.id // .scanJobId // empty')
+          [ -n "$SCAN_ID" ] || { echo "ERROR: no scan id in response: $RESP"; exit 1; }
+          echo "Triggered scan $SCAN_ID"
+
+          # ── 2. Poll to completion (or FAILED / timeout) ─────────────────────
+          DEADLINE=$(( $(date +%s) + 55 * 60 ))
+          STATUS=PENDING
+          while [ "$STATUS" != "COMPLETED" ] && [ "$STATUS" != "FAILED" ]; do
+            [ "$(date +%s)" -le "$DEADLINE" ] || { echo "ERROR: scan $SCAN_ID timed out (last status: $STATUS)"; exit 1; }
+            sleep 15
+            STATUS=$(curl -fsS "$BREACHLENS_API_URL/api/scans/$SCAN_ID" -H "$AUTH" $CF_ARGS | jq -r '.status // "UNKNOWN"')
+            echo "[poll] $STATUS"
+          done
+          [ "$STATUS" != "FAILED" ] || { echo "ERROR: scan $SCAN_ID FAILED"; exit 1; }
+
+          # ── 3. Fetch SARIF ──────────────────────────────────────────────────
+          curl -fsS "$BREACHLENS_API_URL/api/scans/$SCAN_ID/export.sarif" -H "$AUTH" $CF_ARGS -o breachlens.sarif
+          echo "Wrote breachlens.sarif ($(wc -c < breachlens.sarif) bytes)"
+
+          # ── 4. Count by severity + gate ─────────────────────────────────────
+          C=$(jq '[.runs[]?.results[]? | select(.properties.severity == "CRITICAL")] | length' breachlens.sarif)
+          H=$(jq '[.runs[]?.results[]? | select(.properties.severity == "HIGH")]     | length' breachlens.sarif)
+          M=$(jq '[.runs[]?.results[]? | select(.properties.severity == "MEDIUM")]   | length' breachlens.sarif)
+          L=$(jq '[.runs[]?.results[]? | select(.properties.severity == "LOW")]      | length' breachlens.sarif)
+          I=$(jq '[.runs[]?.results[]? | select(.properties.severity == "INFO")]     | length' breachlens.sarif)
+          echo "findings — C:$C H:$H M:$M L:$L I:$I"
+
+          # Gate order: CRITICAL > HIGH > MEDIUM > LOW > INFO. `none` never fails.
+          case "$BREACHLENS_SEVERITY_GATE" in
+            CRITICAL) N=$C ;;
+            HIGH)     N=$(( C + H )) ;;
+            MEDIUM)   N=$(( C + H + M )) ;;
+            LOW)      N=$(( C + H + M + L )) ;;
+            INFO)     N=$(( C + H + M + L + I )) ;;
+            none)     N=0 ;;
+          esac
+          if [ "$BREACHLENS_SEVERITY_GATE" != "none" ] && [ "$N" -gt 0 ]; then
+            echo "Severity gate $BREACHLENS_SEVERITY_GATE: $N finding(s) at or above threshold — failing build."
+            exit 1
+          fi
+          echo "Severity gate $BREACHLENS_SEVERITY_GATE: passed."
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      // Keep the SARIF as a build artifact (feed it to Warnings-NG / a SARIF
+      // viewer plugin if you use one).
+      archiveArtifacts artifacts: 'breachlens.sarif', allowEmptyArchive: true
+    }
+  }
+}

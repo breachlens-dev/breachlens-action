@@ -49,7 +49,10 @@
     BREACHLENS_CONTAINER_ID: ""
     BREACHLENS_DOMAIN_ID: ""
     # Gate + tuning:
-    BREACHLENS_SEVERITY_GATE: "none"      # CRITICAL|HIGH|MEDIUM|LOW|INFO|none
+    BREACHLENS_SEVERITY_GATE: "none"      # CRITICAL|HIGH|MEDIUM|LOW|INFO|none|policy
+    # "policy" defers the pass/fail to BreachLens: it evaluates the policy that
+    # applies to this target (Settings → Policies) and returns the same verdict
+    # the GitHub-App PR check produces. Manage the gate centrally, not in this file.
     BREACHLENS_SCAN_TYPES: ""             # csv e.g. SAST,SCA,SECRET,IAC ; blank = server default
     BREACHLENS_POLL_INTERVAL: "15"        # seconds between status polls
     BREACHLENS_TIMEOUT_MIN: "45"          # hard timeout (PENTEST_FULL can take 30+ min)
@@ -80,8 +83,8 @@
       fi
 
       case "$BREACHLENS_SEVERITY_GATE" in
-        CRITICAL|HIGH|MEDIUM|LOW|INFO|none) ;;
-        *) echo "ERROR: BREACHLENS_SEVERITY_GATE must be CRITICAL/HIGH/MEDIUM/LOW/INFO/none"; exit 1 ;;
+        CRITICAL|HIGH|MEDIUM|LOW|INFO|none|policy) ;;
+        *) echo "ERROR: BREACHLENS_SEVERITY_GATE must be CRITICAL/HIGH/MEDIUM/LOW/INFO/none/policy"; exit 1 ;;
       esac
 
       # Optional Cloudflare Access headers. Service-token id/secret contain no
@@ -152,6 +155,26 @@
       L=$(jq '[.runs[]?.results[]? | select(.properties.severity == "LOW")]      | length' breachlens.sarif)
       I=$(jq '[.runs[]?.results[]? | select(.properties.severity == "INFO")]     | length' breachlens.sarif)
       echo "findings — C:$C H:$H M:$M L:$L I:$I"
+
+      # ── 5. policy gate (defer to BreachLens) ────────────────────────────────
+      # Ask BreachLens for the verdict on the policy that applies to this target
+      # and gate on it — the same verdict the GitHub-App PR check produces. The
+      # runner never sees the policy rules. Terminal: exits before the numeric gate.
+      if [ "$BREACHLENS_SEVERITY_GATE" = "policy" ]; then
+        VERDICT=$(curl -fsS "$BREACHLENS_API_URL/api/scans/$SCAN_ID/policy-verdict" -H "$AUTH" $CF_ARGS $TLS_ARGS)
+        RESULT=$(echo "$VERDICT" | jq -r '.verdict // "neutral"')
+        PNAME=$(echo "$VERDICT" | jq -r '.policyName // "org policy"')
+        if [ "$RESULT" = "failure" ]; then
+          echo "$VERDICT" | jq -r '.violations[]? | "policy: \(.message)"'
+          echo "Org policy \"$PNAME\" failed the pipeline."
+          exit 1
+        elif [ "$RESULT" = "neutral" ]; then
+          echo "No BreachLens policy applies — findings reported but pipeline will not fail."
+        else
+          echo "Org policy \"$PNAME\": passed."
+        fi
+        exit 0
+      fi
 
       # Gate order: CRITICAL > HIGH > MEDIUM > LOW > INFO. `none` never fails.
       case "$BREACHLENS_SEVERITY_GATE" in

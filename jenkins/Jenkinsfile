@@ -39,7 +39,7 @@ pipeline {
     string(name: 'BREACHLENS_API_URL',      defaultValue: 'https://breachlens.example.com', description: 'Base URL of your BreachLens deployment')
     string(name: 'BREACHLENS_TARGET',       defaultValue: '',     description: 'BreachLens resource ID (the cuid from the resource URL)')
     choice(name: 'BREACHLENS_TARGET_KIND',  choices: ['repo', 'container', 'domain'], description: 'What kind of target BREACHLENS_TARGET is')
-    choice(name: 'BREACHLENS_SEVERITY_GATE', choices: ['none', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO'], description: 'Fail the build at this severity or higher')
+    choice(name: 'BREACHLENS_SEVERITY_GATE', choices: ['none', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO', 'policy'], description: "Fail the build at this severity or higher. 'policy' defers the pass/fail to your BreachLens org policy (Settings → Policies) — same verdict as the GitHub-App PR check.")
     string(name: 'BREACHLENS_SCAN_TYPES',   defaultValue: '',     description: 'CSV e.g. SAST,SCA,SECRET,IAC (blank = server default)')
   }
 
@@ -68,8 +68,8 @@ pipeline {
           [ -n "$BREACHLENS_TARGET" ] || { echo "ERROR: set BREACHLENS_TARGET (a BreachLens resource ID)"; exit 1; }
 
           case "$BREACHLENS_SEVERITY_GATE" in
-            CRITICAL|HIGH|MEDIUM|LOW|INFO|none) ;;
-            *) echo "ERROR: BREACHLENS_SEVERITY_GATE must be CRITICAL/HIGH/MEDIUM/LOW/INFO/none"; exit 1 ;;
+            CRITICAL|HIGH|MEDIUM|LOW|INFO|none|policy) ;;
+            *) echo "ERROR: BREACHLENS_SEVERITY_GATE must be CRITICAL/HIGH/MEDIUM/LOW/INFO/none/policy"; exit 1 ;;
           esac
 
           AUTH="Authorization: Bearer $BREACHLENS_API_TOKEN"
@@ -122,6 +122,27 @@ pipeline {
           L=$(jq '[.runs[]?.results[]? | select(.properties.severity == "LOW")]      | length' breachlens.sarif)
           I=$(jq '[.runs[]?.results[]? | select(.properties.severity == "INFO")]     | length' breachlens.sarif)
           echo "findings — C:$C H:$H M:$M L:$L I:$I"
+
+          # ── 5. policy gate (defer to BreachLens) ────────────────────────────
+          # Ask BreachLens for the verdict on the policy that applies to this
+          # target and gate on it — the same verdict the GitHub-App PR check
+          # produces. The agent never sees the policy rules. Terminal: exits
+          # before the numeric gate below.
+          if [ "$BREACHLENS_SEVERITY_GATE" = "policy" ]; then
+            VERDICT=$(curl -fsS "$BREACHLENS_API_URL/api/scans/$SCAN_ID/policy-verdict" -H "$AUTH" $CF_ARGS)
+            RESULT=$(echo "$VERDICT" | jq -r '.verdict // "neutral"')
+            PNAME=$(echo "$VERDICT" | jq -r '.policyName // "org policy"')
+            if [ "$RESULT" = "failure" ]; then
+              echo "$VERDICT" | jq -r '.violations[]? | "policy: \(.message)"'
+              echo "Org policy \"$PNAME\" failed the build."
+              exit 1
+            elif [ "$RESULT" = "neutral" ]; then
+              echo "No BreachLens policy applies — findings reported but build will not fail."
+            else
+              echo "Org policy \"$PNAME\": passed."
+            fi
+            exit 0
+          fi
 
           # Gate order: CRITICAL > HIGH > MEDIUM > LOW > INFO. `none` never fails.
           case "$BREACHLENS_SEVERITY_GATE" in

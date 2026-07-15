@@ -217,7 +217,7 @@ Copy the [Quickstart](#quickstart) workflow into `.github/workflows/security.yml
 | `container-id` | ⚪ ** | — | BreachLens Container ID to scan |
 | `domain-id` | ⚪ ** | — | BreachLens Domain ID to scan |
 | `scan-types` | — | varies | Comma-separated scan types. Defaults vary by target type |
-| `severity-gate` | — | `none` | Fail build if findings ≥ this severity exist. One of `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`, `none` |
+| `severity-gate` | — | `none` | Fail build if findings ≥ this severity exist. One of `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`, `none`, `policy`. `policy` defers the pass/fail to your BreachLens org policy (Settings → Policies) — the runner asks the server for the verdict, the same one the GitHub-App PR check produces. Supported by the GitLab + Jenkins templates too. |
 | `upload-sarif` | — | `true` | Upload SARIF to GitHub Code Scanning |
 | `poll-interval-seconds` | — | `15` | How often to poll scan status |
 | `timeout-minutes` | — | `45` | Hard timeout (PENTEST_FULL can take 30+ min) |

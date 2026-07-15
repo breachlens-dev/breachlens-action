@@ -104,9 +104,13 @@ inputs:
   severity-gate:
     description: |
       Fail the build if findings of this severity or higher are present.
-      One of: CRITICAL, HIGH, MEDIUM, LOW, INFO, none.
+      One of: CRITICAL, HIGH, MEDIUM, LOW, INFO, none, policy.
       Default 'none' = report findings but never fail the build.
       Recommended for production: HIGH (allows MEDIUM noise without blocking).
+      'policy' defers the pass/fail to BreachLens: it evaluates the policy that
+      applies to this target (Settings → Policies — a per-repo assignment, else
+      the org default) server-side and returns the same verdict the GitHub-App
+      PR check produces. Manage the gate centrally instead of in this file.
     required: false
     default: 'none'
 
@@ -179,8 +183,8 @@ runs:
         fi
         # Severity gate must be one of the allowed values.
         case "${{ inputs.severity-gate }}" in
-          CRITICAL|HIGH|MEDIUM|LOW|INFO|none) ;;
-          *) echo "::error::Invalid severity-gate '${{ inputs.severity-gate }}' — must be CRITICAL/HIGH/MEDIUM/LOW/INFO/none."; exit 1 ;;
+          CRITICAL|HIGH|MEDIUM|LOW|INFO|none|policy) ;;
+          *) echo "::error::Invalid severity-gate '${{ inputs.severity-gate }}' — must be CRITICAL/HIGH/MEDIUM/LOW/INFO/none/policy."; exit 1 ;;
         esac
         # Cloudflare Access service token is optional, but the pair is all-or-nothing.
         CF_ID="${{ inputs.cf-access-client-id }}"
@@ -385,6 +389,12 @@ runs:
       env:
         SARIF_PATH:    ${{ steps.fetch-sarif.outputs.path }}
         SEVERITY_GATE: ${{ inputs.severity-gate }}
+        API_URL:          ${{ inputs.api-url }}
+        API_TOKEN:        ${{ inputs.api-token }}
+        SESSION:          ${{ inputs.session-cookie }}
+        SCAN_ID:          ${{ steps.trigger.outputs.scan-id }}
+        CF_CLIENT_ID:     ${{ inputs.cf-access-client-id }}
+        CF_CLIENT_SECRET: ${{ inputs.cf-access-client-secret }}
       run: |
         # The SARIF properties bag carries `severity` directly.
         # Count by severity buckets the BreachLens way.
@@ -422,6 +432,28 @@ runs:
           LOW)      (( CRITICAL + HIGH + MEDIUM + LOW > 0 )) && { echo "::error::Severity gate LOW: found $((CRITICAL + HIGH + MEDIUM + LOW)) LOW-or-above findings."; exit 1; } ;;
           INFO)     (( CRITICAL + HIGH + MEDIUM + LOW + INFO > 0 )) && { echo "::error::Severity gate INFO: found $((CRITICAL + HIGH + MEDIUM + LOW + INFO)) total findings."; exit 1; } ;;
           none)     echo "✓ Severity gate disabled — findings reported but build will not fail." ;;
+          policy)
+            # Defer the gate to BreachLens: evaluate the policy that applies to
+            # this target server-side and gate on its verdict — the same one the
+            # GitHub-App PR check produces. The runner never sees the policy rules.
+            if [[ -n "$API_TOKEN" ]]; then AUTH_HEADER="Authorization: Bearer $API_TOKEN"; else AUTH_HEADER="Cookie: connect.sid=$SESSION"; fi
+            CF_HEADERS=()
+            if [[ -n "$CF_CLIENT_ID" && -n "$CF_CLIENT_SECRET" ]]; then
+              CF_HEADERS=(-H "CF-Access-Client-Id: $CF_CLIENT_ID" -H "CF-Access-Client-Secret: $CF_CLIENT_SECRET")
+            fi
+            VERDICT=$(curl -fsS "$API_URL/api/scans/$SCAN_ID/policy-verdict" -H "$AUTH_HEADER" "${CF_HEADERS[@]}")
+            RESULT=$(echo "$VERDICT" | jq -r '.verdict // "neutral"')
+            PNAME=$(echo "$VERDICT" | jq -r '.policyName // "org policy"')
+            if [[ "$RESULT" == "failure" ]]; then
+              echo "$VERDICT" | jq -r '.violations[]? | "::error::policy: \(.message)"'
+              echo "::error::Org policy \"$PNAME\" failed the build."
+              exit 1
+            elif [[ "$RESULT" == "neutral" ]]; then
+              echo "✓ No BreachLens policy applies — findings reported but build will not fail."
+            else
+              echo "✓ Org policy \"$PNAME\": passed."
+            fi
+            ;;
         esac
 
     - name: Upload SARIF to GitHub Code Scanning
